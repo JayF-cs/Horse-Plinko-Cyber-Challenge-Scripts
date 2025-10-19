@@ -1,0 +1,203 @@
+#Run sudo ss -tupln <-------- Check ports or if available ------> sudo netstat -planet
+#Common sus ports 4444, 1337, 9001, 8080
+#Run sudo rm -f /path/to/malware <---------- to remove malware
+sudo pkill <process_name> <--------or--------> udo kill -9 <PID> <-------------- to kill process
+
+#Helpful tool installation
+#sudo apt update
+#sudo apt install -y htop
+
+#========================================================== SCRIPT???????
+#!/usr/bin/env bash
+# threat_helper.sh - interactive helper for hunting/killing/quarantining processes
+# Run as root: sudo /usr/local/sbin/threat_helper.sh
+set -euo pipefail
+IFS=$'\n\t'
+
+QDIR="/root/quarantine"
+LOGDIR="/var/log/threat_helper"
+LOGFILE="${LOGDIR}/actions.log"
+mkdir -p "$QDIR" "$LOGDIR"
+touch "$LOGFILE"
+
+timestamp() { date -u +"%F_%H%M%S"; }
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: must run as root"
+    exit 1
+  fi
+}
+
+pause() { read -rp "Press ENTER to continue..."; }
+
+show_listeners() {
+  echo "=== Listening sockets (ss -tulpen) ==="
+  ss -tulpen 2>/dev/null || { echo "ss not available"; }
+}
+
+show_suspicious_procs() {
+  echo "=== Suspicious processes (look for nc/python/bash /tmp etc.) ==="
+  ps -eo pid,user,cmd --no-headers --sort=-%mem | \
+    egrep -i "nc[[:space:]]|ncat|socat|bash -i|/dev/tcp|python|perl|ruby|curl |wget|sh -c" --color=never || true
+  echo
+  echo "=== Processes whose exe is in /tmp /dev/shm /var/tmp or homes ==="
+  for pid in $(ps -eo pid=); do
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    if [[ -n "$exe" && ( "$exe" = /tmp/* || "$exe" = /dev/shm/* || "$exe" = /var/tmp/* || "$exe" = /home/* ) ]]; then
+      ps -o pid,user,cmd -p "$pid" --no-headers
+      echo "   -> exe: $exe"
+    fi
+  done
+}
+
+show_logged_in() {
+  echo "=== Logged in users (who -a) ==="
+  who -a
+}
+
+inspect_pid() {
+  read -rp "Enter PID to inspect: " PID
+  if ! [[ "$PID" =~ ^[0-9]+$ ]]; then echo "Invalid PID"; return; fi
+  if ! kill -0 "$PID" 2>/dev/null; then echo "Process $PID not found (or exited)"; return; fi
+
+  echo
+  echo "Process summary:"
+  ps -o user,pid,cmd -p "$PID" --no-headers || true
+  EXE=$(readlink -f "/proc/$PID/exe" 2>/dev/null || true)
+  echo "Executable path: ${EXE:-(none)}"
+  echo -n "Commandline: "; tr '\0' ' ' < /proc/$PID/cmdline || echo "(not readable)"; echo
+  echo "Open files / network (lsof -p $PID):"
+  if command -v lsof >/dev/null 2>&1; then lsof -p "$PID" 2>/dev/null || true; else echo "lsof not installed"; fi
+  echo "Owner / perms:"
+  if [ -n "$EXE" ] && [ -f "$EXE" ]; then
+    ls -l "$EXE"
+    stat -c "Size:%s  Mtime:%y" "$EXE"
+    sha256sum "$EXE" 2>/dev/null || true
+  fi
+
+  # actions
+  echo
+  echo "Actions available for PID $PID:"
+  echo "  1) Copy binary to quarantine"
+  echo "  2) Show first 200 strings of binary"
+  echo "  3) Kill process (requires confirmation)"
+  echo "  4) Lock / Delete owner user (requires confirmation)"
+  echo "  5) Back to menu"
+  read -rp "Choose an action [1-5]: " act
+  case "$act" in
+    1)
+      if [ -n "$EXE" ] && [ -f "$EXE" ]; then
+        QFN="${QDIR}/quarantine_${PID}_$(timestamp)_$(basename "$EXE")"
+        cp -f "$EXE" "$QFN" 2>/dev/null || { echo "Copy failed"; return; }
+        chmod 600 "$QFN"
+        echo "$(date -u) COPIED $EXE -> $QFN" | tee -a "$LOGFILE"
+        echo "Copied to $QFN"
+      else
+        echo "No executable file to copy"
+      fi
+      ;;
+    2)
+      if [ -n "$EXE" ] && [ -f "$EXE" ]; then
+        echo "=== strings (first 200 lines) ==="
+        strings "$EXE" | sed -n '1,200p'
+      else
+        echo "No executable to run strings on"
+      fi
+      ;;
+    3)
+      read -rp "Really kill PID $PID? Type 'yes' to proceed: " confirm
+      if [ "$confirm" = "yes" ]; then
+        echo "$(date -u) KILL pid=$PID by $(whoami)" | tee -a "$LOGFILE"
+        kill -9 "$PID" 2>/dev/null || echo "kill failed or already exited"
+        echo "Killed $PID"
+      else
+        echo "Aborted kill"
+      fi
+      ;;
+    4)
+      USERNAME=$(ps -o user= -p "$PID" 2>/dev/null || true)
+      if [ -z "$USERNAME" ]; then echo "Could not determine owner"; return; fi
+      echo "Owner user is: $USERNAME"
+      echo "Options: (L)ock account, (D)elete account, (C)ancel"
+      read -rp "Choose L/D/C: " ud
+      if [[ "$ud" = "L" || "$ud" = "l" ]]; then
+        read -rp "Type 'yes' to LOCK user $USERNAME: " c2
+        if [ "$c2" = "yes" ]; then
+          passwd -l "$USERNAME" 2>/dev/null || echo "passwd -l may have failed"
+          echo "$(date -u) LOCKED user=$USERNAME by $(whoami)" | tee -a "$LOGFILE"
+          echo "User locked"
+        else
+          echo "Aborted lock"
+        fi
+      elif [[ "$ud" = "D" || "$ud" = "d" ]]; then
+        read -rp "Type 'DELETE' to permanently remove user $USERNAME (this will remove home): " c3
+        if [ "$c3" = "DELETE" ]; then
+          userdel -r "$USERNAME" 2>/dev/null || echo "userdel may have failed"
+          echo "$(date -u) DELETED user=$USERNAME by $(whoami)" | tee -a "$LOGFILE"
+          echo "User deleted"
+        else
+          echo "Aborted delete"
+        fi
+      else
+        echo "Canceling user action"
+      fi
+      ;;
+    *)
+      echo "Returning to menu"
+      ;;
+  esac
+  echo; pause
+}
+
+kill_pid_direct() {
+  read -rp "Enter PID to kill: " KP
+  if ! [[ "$KP" =~ ^[0-9]+$ ]]; then echo "Invalid PID"; return; fi
+  ps -o user,pid,cmd -p "$KP" --no-headers || { echo "PID not found"; return; }
+  read -rp "Type 'yes' to confirm kill $KP: " cc
+  if [ "$cc" = "yes" ]; then
+    # recommend quarantine first
+    EXE=$(readlink -f "/proc/$KP/exe" 2>/dev/null || true)
+    if [ -n "$EXE" ] && [ -f "$EXE" ]; then
+      echo "Recommend copying binary to quarantine first. Copy now? (y/N)"
+      read -r cpy
+      if [[ "$cpy" = "y" || "$cpy" = "Y" ]]; then
+        cp -f "$EXE" "${QDIR}/quarantine_${KP}_$(timestamp)_$(basename "$EXE")" 2>/dev/null && chmod 600 "${QDIR}/quarantine_${KP}_$(timestamp)_$(basename "$EXE")"
+        echo "$(date -u) COPIED $EXE before kill" | tee -a "$LOGFILE"
+      fi
+    fi
+    kill -9 "$KP" 2>/dev/null || echo "kill failed"
+    echo "$(date -u) KILLED pid=$KP" | tee -a "$LOGFILE"
+  else
+    echo "Abort"
+  fi
+  pause
+}
+
+main_menu() {
+  require_root
+  while true; do
+    clear
+    echo "Threat helper - menu"
+    echo "1) Show listening sockets (ss)"
+    echo "2) Show suspicious processes (names and /tmp/exe)"
+    echo "3) Show logged in users (who)"
+    echo "4) Inspect a PID"
+    echo "5) Kill a PID"
+    echo "6) Lock or Delete owning user of a PID"
+    echo "7) Quit"
+    read -rp "Choose [1-7]: " choice
+    case "$choice" in
+      1) show_listeners; pause ;;
+      2) show_suspicious_procs; pause ;;
+      3) show_logged_in; pause ;;
+      4) inspect_pid ;;
+      5) kill_pid_direct ;;
+      6) inspect_pid ;; # inspect_pid includes locking/deleting options
+      7) echo "Goodbye"; exit 0 ;;
+      *) echo "Invalid"; sleep 1 ;;
+    esac
+  done
+}
+
+main_menu

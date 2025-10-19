@@ -1,0 +1,46 @@
+#Run sudo visudo <-------- See all users with admin access
+#Run sudo ls -l /etc/sudoers.d/ <------- To see other sudo rules
+#Run sudo cp /etc/sudoers /root/sudoers_backup <--------- To make a copy of sudoers
+#Run sudo rm /etc/sudoers.d/baduser <------ To remove weird shit
+#Run getent group sudo <----- To view all users in sudo group
+#Run sudo deluser baduser sudo <----- To remove user in sudo group
+
+#==================================
+#!/usr/bin/env bash
+# ---------------------------------------
+# sudo_audit.sh — Audit sudoers and groups
+# Works on Debian 12 & AlmaLinux 9
+# ---------------------------------------
+
+echo "[*] Starting sudoers audit..."
+
+# 1️⃣ Backup sudoers files (safety)
+sudo mkdir -p /root/audit_backups
+sudo cp /etc/sudoers /root/audit_backups/sudoers.bak 2>/dev/null || true
+sudo cp -r /etc/sudoers.d /root/audit_backups/sudoers.d.bak 2>/dev/null || true
+echo "[*] Backups saved to /root/audit_backups/"
+
+# 2️⃣ Check for suspicious sudoers entries
+echo -e "\n[*] Checking /etc/sudoers..."
+sudo grep -vE '^#|^$' /etc/sudoers
+
+echo -e "\n[*] Listing files in /etc/sudoers.d/..."
+sudo ls -l /etc/sudoers.d/ 2>/dev/null || echo "No /etc/sudoers.d directory found."
+
+# 3️⃣ Display users in admin groups
+echo -e "\n[*] Users in sudo/wheel groups:"
+getent group sudo 2>/dev/null || echo "No sudo group found."
+getent group wheel 2>/dev/null || echo "No wheel group found."
+
+# 4️⃣ List all non-system users (UID >= 1000)
+echo -e "\n[*] Listing regular users on the system:"
+awk -F: '($3>=1000){print $1}' /etc/passwd
+
+# 5️⃣ Check which users have sudo privileges
+echo -e "\n[*] Checking sudo privileges for each regular user..."
+awk -F: '($3>=1000){print $1}' /etc/passwd | while read user; do
+    echo -e "\n--- Sudo privileges for user: $user ---"
+    sudo -l -U "$user" 2>/dev/null | grep -E 'User|may run|ALL' || echo "No sudo access."
+done
+
+echo -e "\n✅ Sudo audit complete."

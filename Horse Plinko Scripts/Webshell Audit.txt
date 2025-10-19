@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# scan_webshells.sh — read-only scanner for common webshell indicators
+# Produces a cleaned report and a separate suspect-paths file.
+# Usage: sudo /usr/local/bin/scan_webshells.sh
+set -euo pipefail
+IFS=$'\n\t'
+
+TS=$(date +%F_%H%M%S)
+OUT="/tmp/webshell_scan_${TS}.txt"
+SUSPECTS="/tmp/webshell_suspect_paths_${TS}.txt"
+
+# Ensure clean start
+: > "$OUT"
+: > "$SUSPECTS"
+
+SEARCH_PATHS=(/var/www /srv /usr/share/nginx /home /tmp /var/tmp /dev/shm)
+
+echo "Webshell scan started: $(date -u)" | tee -a "$OUT"
+echo "Scanned paths: ${SEARCH_PATHS[*]}" | tee -a "$OUT"
+echo "Report timestamp: $TS" | tee -a "$OUT"
+echo "----------------------------------------" | tee -a "$OUT"
+
+# Helper: append section header
+section() { printf "\n=== %s ===\n" "$1" | tee -a "$OUT"; }
+
+# 1) Recent files (7 days)
+section "Recent files (modified in last 7 days)"
+for p in "${SEARCH_PATHS[@]}"; do
+  if [ -d "$p" ]; then
+    # print path header then results (if any)
+    echo "--- $p ---" >> "$OUT"
+    find "$p" -type f -mtime -7 -printf "%p\t%TY-%Tm-%Td_%TH:%TM:%TS\n" 2>/dev/null >> "$OUT" || true
+  fi
+done
+
+# 2) World-writable files
+section "World-writable files (others-writable)"
+for p in "${SEARCH_PATHS[@]}"; do
+  if [ -d "$p" ]; then
+    find "$p" -type f -perm /o+w -ls 2>/dev/null >> "$OUT" || true
+  fi
+done
+
+# 3) PHP suspicious patterns
+section "PHP suspicious patterns (eval|base64_decode|shell_exec|passthru|system|exec|preg_replace /e)"
+for p in "${SEARCH_PATHS[@]}"; do
+  if [ -d "$p" ]; then
+    # grep prints filename:line:match; append to OUT
+    grep -RIn --binary-files=without-match -E "eval\s*\(|base64_decode\s*\(|shell_exec\s*\(|passthru\s*\(|\bexec\s*\(|preg_replace\s*\(.*\/e" "$p" 2>/dev/null >> "$OUT" || true
+  fi
+done
+
+# 4) Downloader one-liners
+section "Downloader one-liners (curl|wget piped to sh)"
+for p in "${SEARCH_PATHS[@]}"; do
+  if [ -d "$p" ]; then
+    grep -RIn --binary-files=without-match -E "curl .*\\| sh|wget .* -O -|wget .* \\| sh|bash <\\(curl" "$p" 2>/dev/null >> "$OUT" || true
+  fi
+done
+
+# 5) Other interpreter one-liners
+section "Other suspicious patterns (python -c|perl -e|php -r)"
+for p in "${SEARCH_PATHS[@]}"; do
+  if [ -d "$p" ]; then
+    grep -RIn --binary-files=without-match -E "python\s+-c|perl\s+-e|php\s+-r" "$p" 2>/dev/null >> "$OUT" || true
+  fi
+done
+
+# 6) Suspicious filenames
+section "Files with suspicious names (shell, backdoor, uploader, wso, c99, r57)"
+for p in "${SEARCH_PATHS[@]}"; do
+  if [ -d "$p" ]; then
+    find "$p" -type f -iregex '.*\(shell\|backdoor\|uploader\|wso\|c99\|r57\)\.*' -ls 2>/dev/null >> "$OUT" || true
+  fi
+done
+
+# 7) Executable files in webroots
+section "Executable files in webroots (perm /111)"
+for p in "${SEARCH_PATHS[@]}"; do
+  if [ -d "$p" ]; then
+    find "$p" -type f -perm /111 -ls 2>/dev/null >> "$OUT" || true
+  fi
+done
+
+# 8) Look for POSTs in access logs (last 200 lines)
+section "Recent POSTs in common access logs (last 200 lines)"
+LOGS=(/var/log/apache2/access.log /var/log/apache2/*access.log /var/log/nginx/access.log /var/log/nginx/*access.log)
+for lg in "${LOGS[@]}"; do
+  if [ -f "$lg" ]; then
+    echo "--- $lg ---" >> "$OUT"
+    tail -n 200 "$lg" 2>/dev/null | egrep "POST|upload|multipart/form-data" >> "$OUT" || true
+  fi
+done
+
+# ------------------------
+# CLEANING & SUSPECT EXTRACTION
+# ------------------------
+# Extract lines that look like file hits (filename:linenumber:content or find output with path)
+# We try several heuristics to capture file paths from the report and write unique list to SUSPECTS.
+
+# 1) capture grep output lines that start with a path
+grep -E "^[^:]+:[0-9]+:" "$OUT" | sed -E 's/^([^:]+):[0-9]+:.*/\1/' >> "$SUSPECTS" || true
+
+# 2) capture find -ls style paths (the path is at the end or start; we grab any slashes)
+grep -E "(/[^ ]+)+" "$OUT" | sed -nE 's/.*(\/[A-Za-z0-9_./-]+).*/\1/p' >> "$SUSPECTS" || true
+
+# 3) capture plain find outputs (from earlier find -printf)
+grep -E '^/' "$OUT" | awk -F'\t' '{print $1}' >> "$SUSPECTS" || true
+
+# canonicalize and deduplicate
+if [ -f "$SUSPECTS" ]; then
+  sort -u "$SUSPECTS" -o "$SUSPECTS" || true
+fi
+
+# Remove empty lines
+sed -i '/^\s*$/d' "$SUSPECTS" || true
+
+# Final notes appended to report
+echo "" >> "$OUT"
+echo "----------------------------------------" >> "$OUT"
+echo "Suspect file paths (one per line): $SUSPECTS" | tee -a "$OUT"
+echo "Report finished: $(date -u)" | tee -a "$OUT"
+
+# Print quick summary to stdout
+echo ""
+echo "Scan complete. Report: $OUT"
+echo "Suspect paths: $SUSPECTS"
+echo "Tip: inspect each path with 'sudo less <path>' or capture it with 'sudo cp <path> /root/quarantine/'."

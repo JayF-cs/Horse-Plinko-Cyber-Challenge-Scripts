@@ -1,0 +1,7 @@
+#MUST INSTALL ufw
+#sudo apt install ufw -y
+#RUN THIS BEFORE ENABLING FIREWALL ----> sudo ufw allow ssh <------- This enables ssh without this you CANNOT LOG IN
+#	Do this for MySQL and http
+#Run sudo ufw default deny incoming <----- Prevents stuff going in
+#Run sudo ufw default allow outgoing <--- allows stuff to go out
+#Run sudo ufw logging on <------ To log intrusion attempts <-------- Saved to /var/log/ufw.log

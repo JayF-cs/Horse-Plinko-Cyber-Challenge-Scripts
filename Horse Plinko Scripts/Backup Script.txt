@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+
+# backup_targets.sh - create timestamped backups of /etc /var /opt /home
+# Run as root: sudo /usr/local/sbin/backup_system.sh
+
+# IMPORTANT: Changed 'set -euo pipefail' to 'set -eu' to bypass compatibility issues
+# The 'pipefail' feature is the likely cause of the 'Illegal option' error on some systems.
+set -eu
+IFS=$'\n\t'
+
+# ==================================
+#             CONFIG
+# ==================================
+OUTDIR="/.backups"              # local backup dir (hidden)
+TARGETS=(/etc /var /opt /home)  # directories to archive
+MIN_FREE_MB=200                 # require at least this much free space on OUTDIR filesystem
+IMMUTABLE=true                  # Set to true to chattr +i the OUTDIR after backup
+
+# REMOTE CONFIG (Configured for generator.team6.plinko.horse)
+REMOTE_COPY=true                                # <--- CHANGED: Set to true to off-load to generator
+REMOTE_USER="backup_transfer"                   # User on the generator server authorized to receive files
+REMOTE_HOST="generator.team6.plinko.horse"      # <--- CHANGED: Use the specified DNS hostname
+REMOTE_DIR="/safe/backups"                      # Remote directory to store the archives
+# ==================================
+
+# --- Pre-Checks ---
+if [ "$(id -u)" -ne 0 ]; then
+    echo "❌ ERROR: Must run as root or with sudo to access all system files."
+    exit 2
+fi
+
+# Locate binaries and ensure they exist
+TAR_BIN=$(command -v tar)
+CHATTR_BIN=$(command -v chattr || true)
+SCP_BIN=$(command -v scp || true)
+
+if [ -z "$TAR_BIN" ]; then
+    echo "❌ ERROR: tar not found. Please install the package."
+    exit 3
+fi
+
+# =================================================================
+# 1. VARIABLE DEFINITION
+# =================================================================
+TIMESTAMP=$(date +%F_%H%M%S)
+ARCHIVE_BASE="system_backup_${TIMESTAMP}"
+ARCHIVE_PATH="${OUTDIR}/${ARCHIVE_BASE}.tar.gz"
+LOGFILE="${OUTDIR}/${ARCHIVE_BASE}.log"
+# =================================================================
+
+# =================================================================
+# 2. FIX: CREATE DIRECTORY BEFORE LOGGING
+#    This resolves the "No such file or directory" error with tee.
+# =================================================================
+mkdir -p "$OUTDIR"
+chmod 700 "$OUTDIR"
+# =================================================================
+
+# =================================================================
+# 3. FIX: UNLOCK DIRECTORY FIRST (The crucial step for immutability)
+# =================================================================
+if [ "$IMMUTABLE" = true ] && [ -n "$CHATTR_BIN" ]; then
+    # Temporarily remove the immutable flag if set (ignore errors if it's not set)
+    "$CHATTR_BIN" -i "$OUTDIR" 2>>/dev/null || true
+    # Now we can safely log this, as the directory exists
+    echo "Immutability temporarily cleared for backup operation." | tee -a "$LOGFILE"
+fi
+# =================================================================
+
+# --- Start Logging Console Output ---
+echo "==== Backup started: $(date -u) ====" | tee -a "$LOGFILE"
+echo "Targets: ${TARGETS[*]}" | tee -a "$LOGFILE"
+
+# --- Check Free Space ---
+fs_dev_kb=$(df -P "$OUTDIR" | tail -1 | awk '{print $4}')
+free_mb=$(( fs_dev_kb / 1024 ))
+
+if [ "$free_mb" -lt "$MIN_FREE_MB" ]; then
+    echo "❌ ERROR: Only ${free_mb}MB free on the backup filesystem. Need at least ${MIN_FREE_MB}MB." | tee -a "$LOGFILE"
+    exit 4
+fi
+echo "Free space check: OK (${free_mb}MB available)." | tee -a "$LOGFILE"
+
+# --- Backup Process ---
+echo "Creating archive at: $ARCHIVE_PATH" | tee -a "$LOGFILE"
+
+# Create tar (preserving permissions, SELinux context, and extended attributes)
+EXCLUDES=("--exclude=/var/log/journal" "--exclude=/proc" "--exclude=/sys")
+if "$TAR_BIN" -czpf "$ARCHIVE_PATH" "${EXCLUDES[@]}" "${TARGETS[@]}" 2>>"$LOGFILE"; then
+    echo "✅ Archive creation successful." | tee -a "$LOGFILE"
+else
+    echo "❌ ERROR: Archive creation failed. See $LOGFILE for details." | tee -a "$LOGFILE"
+    exit 5
+fi
+
+# --- Archive Verification ---
+echo "Verifying archive integrity..." | tee -a "$LOGFILE"
+if "$TAR_BIN" -tzf "$ARCHIVE_PATH" > /dev/null 2>>"$LOGFILE"; then
+    echo "✅ Archive verification: OK" | tee -a "$LOGFILE"
+else
+    echo "❌ ERROR: Archive verification failed. The file may be corrupt. See $LOGFILE" | tee -a "$LOGFILE"
+    exit 6
+fi
+
+# --- Optional Remote Copy ---
+if [ "$REMOTE_COPY" = true ]; then
+    if [ -z "$SCP_BIN" ]; then
+        echo "❌ ERROR: scp not found, cannot copy to remote." | tee -a "$LOGFILE"
+        exit 7
+    fi
+    echo "Copying to remote ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}..." | tee -a "$LOGFILE"
+    # Ensure key-based SSH authentication is set up for the user running this script (root or cron user)
+    if "$SCP_BIN" "$ARCHIVE_PATH" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"; then
+        echo "✅ Remote copy succeeded." | tee -a "$LOGFILE"
+    else
+        echo "⚠️ WARNING: Remote copy failed." | tee -a "$LOGFILE"
+        # NOTE: If this fails, the local backup is still secure and immutable
+    fi
+fi
+
+# --- Optional Immutability ---
+if [ "$IMMUTABLE" = true ]; then
+    if [ -n "$CHATTR_BIN" ]; then
+        echo "Setting immutable flag on $OUTDIR (chattr +i)" | tee -a "$LOGFILE"
+        # Reapply immutability to lock down the new backup and log files
+        if "$CHATTR_BIN" +i "$OUTDIR" 2>>"$LOGFILE"; then
+            echo "✅ Immutability set." | tee -a "$LOGFILE"
+        else
+            echo "⚠️ WARNING: chattr failed (maybe not an ext/xfs filesystem)." | tee -a "$LOGFILE"
+        fi
+    else
+        echo "⚠️ WARNING: chattr not found; cannot set immutable flag." | tee -a "$LOGFILE"
+    fi
+fi
+
+echo "==== Backup completed: $(date -u) ====" | tee -a "$LOGFILE"
+echo "Final Archive: $ARCHIVE_PATH"
+echo "Log File: $LOGFILE"
+exit 0
